@@ -1,0 +1,855 @@
+```
+UniversalApp/
+├── app/
+│   ├── src/
+│   │   ├── main/
+│   │   │   ├── java/
+│   │   │   │   └── com/example/universalapp/
+│   │   │   │       └── MainActivity.kt
+│   │   │   ├── res/
+│   │   │   │   ├── drawable/
+│   │   │   │   │   └── ic_launcher_foreground.xml
+│   │   │   │   ├── mipmap-anydpi-v26/
+│   │   │   │   │   ├── ic_launcher.xml
+│   │   │   │   │   └── ic_launcher_round.xml
+│   │   │   │   ├── values/
+│   │   │   │   │   ├── strings.xml
+│   │   │   │   │   ├── themes.xml
+│   │   │   │   │   └── colors.xml
+│   │   │   └── AndroidManifest.xml
+│   ├── build.gradle
+│   └── proguard-rules.pro
+├── build.gradle
+├── settings.gradle
+└── codemagic.yaml
+```
+
+### File Contents
+
+#### UniversalApp/app/src/main/java/com/example/universalapp/MainActivity.kt
+```kotlin
+package com.example.universalapp
+
+import android.annotation.SuppressLint
+import android.app.Application
+import android.net.Uri
+import android.os.Bundle
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.ExperimentalAnimationApi
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import androidx.room.*
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+
+// ---------------- CONFIG ----------------
+private const val AD_DURATION_MS = 2200L // ad overlay length
+private val AppGradient = Brush.verticalGradient(
+    listOf(Color(0xFFFEE3FF), Color(0xFFE4F0FF), Color(0xFFFDF2E9))
+)
+private val TileShape = RoundedCornerShape(20.dp)
+private val SectionShape = RoundedCornerShape(26.dp)
+private val TileContainer = Color.White
+private val SectionContainer = Color.White.copy(alpha = 0.75f)
+
+// ---------------- ROOM ENTITIES ----------------
+@Entity(tableName = "categories")
+data class CategoryEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    @ColumnInfo(index = true) val title: String,
+    val sortOrder: Int = 0
+)
+
+@Entity(
+    tableName = "apps",
+    foreignKeys = [ForeignKey(
+        entity = CategoryEntity::class,
+        parentColumns = ["id"],
+        childColumns = ["categoryId"],
+        onDelete = ForeignKey.CASCADE
+    )],
+    indices = [Index("categoryId"), Index("name")]
+)
+data class AppEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    @ColumnInfo(index = true) val categoryId: Long,
+    val name: String,
+    val website: String,
+    val logoUrl: String? // keep URL; fallback will use Clearbit
+)
+
+// Relation for UI
+data class CategoryWithApps(
+    @Embedded val category: CategoryEntity,
+    @Relation(parentColumn = "id", entityColumn = "categoryId")
+    val apps: List<AppEntity>
+)
+
+// ---------------- ROOM DAOs ----------------
+@Dao
+interface CategoryDao {
+    @Query("SELECT COUNT(*) FROM categories") suspend fun count(): Int
+    @Transaction
+    @Query("SELECT * FROM categories ORDER BY sortOrder, title")
+    fun observeWithApps(): Flow<List<CategoryWithApps>>
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAll(categories: List<CategoryEntity>): List<Long>
+}
+
+@Dao
+interface AppDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAll(apps: List<AppEntity>)
+}
+
+// ---------------- ROOM DB ----------------
+@Database(entities = [CategoryEntity::class, AppEntity::class], version = 1, exportSchema = false)
+abstract class UniversalDb : RoomDatabase() {
+    abstract fun categoryDao(): CategoryDao
+    abstract fun appDao(): AppDao
+
+    companion object {
+        @Volatile private var INSTANCE: UniversalDb? = null
+        fun get(app: Application): UniversalDb =
+            INSTANCE ?: synchronized(this) {
+                Room.databaseBuilder(app, UniversalDb::class.java, "universal.db")
+                    .fallbackToDestructiveMigration()
+                    .build()
+                    .also { INSTANCE = it }
+            }
+    }
+}
+
+// ---------------- REPOSITORY ----------------
+class UniversalRepository(private val db: UniversalDb) {
+    fun observe(): Flow<List<CategoryWithApps>> = db.categoryDao().observeWithApps()
+
+    // Seed the database once
+    suspend fun ensureSeeded() {
+        if (db.categoryDao().count() > 0) return
+
+        // --- Define categories (sorted to match your layout style) ---
+        val cats = listOf(
+            CategoryEntity(title = "Browsers", sortOrder = 0),
+            CategoryEntity(title = "AI Tools", sortOrder = 1),
+            CategoryEntity(title = "Streaming", sortOrder = 2),
+            CategoryEntity(title = "Music", sortOrder = 3),
+            CategoryEntity(title = "Tools", sortOrder = 4),
+            CategoryEntity(title = "Shopping", sortOrder = 5),
+            CategoryEntity(title = "Books & Comics", sortOrder = 6),
+            CategoryEntity(title = "Payment", sortOrder = 7),
+            CategoryEntity(title = "Courses", sortOrder = 8),
+            CategoryEntity(title = "Google & Others", sortOrder = 9),
+            CategoryEntity(title = "Business", sortOrder = 10),
+            CategoryEntity(title = "Links/APKs", sortOrder = 11)
+        )
+        val ids = db.categoryDao().insertAll(cats)
+        // helper to read id by title (works because this is first run)
+        fun idOf(title: String) = ids[cats.indexOfFirst { it.title == title }]
+
+        val apps = mutableListOf<AppEntity>()
+
+        // --- Browsers ---
+        run {
+            val c = idOf("Browsers")
+            apps += AppEntity(categoryId = c, name = "Chrome", website = "https://www.google.com/chrome/", logoUrl = "https://logo.clearbit.com/google.com")
+            apps += AppEntity(categoryId = c, name = "Edge", website = "https://www.microsoft.com/edge", logoUrl = "https://logo.clearbit.com/microsoft.com")
+            apps += AppEntity(categoryId = c, name = "Brave", website = "https://brave.com/", logoUrl = "https://logo.clearbit.com/brave.com")
+            apps += AppEntity(categoryId = c, name = "Firefox", website = "https://www.mozilla.org/firefox/", logoUrl = "https://logo.clearbit.com/mozilla.org")
+        }
+
+        // --- AI Tools ---
+        run {
+            val c = idOf("AI Tools")
+            apps += AppEntity(c, "ChatGPT", "https://chat.openai.com/", "https://upload.wikimedia.org/wikipedia/commons/0/04/ChatGPT_logo.svg")
+            apps += AppEntity(c, "Anthropic (Claude)", "https://claude.ai/", null)
+            apps += AppEntity(c, "Gemini", "https://gemini.google/", null)
+            apps += AppEntity(c, "Perplexity", "https://www.perplexity.ai/", null)
+            apps += AppEntity(c, "Grok", "https://x.ai/", null)
+            apps += AppEntity(c, "Llama (Meta AI)", "https://ai.meta.com/", null)
+            apps += AppEntity(c, "Copilot", "https://copilot.microsoft.com/", null)
+        }
+
+        // --- Streaming ---
+        run {
+            val c = idOf("Streaming")
+            apps += AppEntity(c, "Netflix", "https://www.netflix.com/", "https://upload.wikimedia.org/wikipedia/commons/0/08/Netflix_2015_logo.svg")
+            apps += AppEntity(c, "YouTube", "https://www.youtube.com/", "https://upload.wikimedia.org/wikipedia/commons/b/b8/YouTube_Logo_2017.svg")
+            apps += AppEntity(c, "Disney+ Hotstar", "https://www.hotstar.com/", null)
+            apps += AppEntity(c, "PikaShow", "https://pikashowlite.com/", null) // fallback logo
+        }
+
+        // --- Music ---
+        run {
+            val c = idOf("Music")
+            apps += AppEntity(c, "Spotify", "https://open.spotify.com/", "https://logo.clearbit.com/spotify.com")
+            apps += AppEntity(c, "YouTube Music", "https://music.youtube.com/", null)
+            apps += AppEntity(c, "JioSaavn", "https://www.jiosaavn.com/", "https://logo.clearbit.com/jiosaavn.com")
+            apps += AppEntity(c, "Wynk Music", "https://wynk.in/music", "https://logo.clearbit.com/wynk.in")
+        }
+
+        // --- Tools ---
+        run {
+            val c = idOf("Tools")
+            apps += AppEntity(c, "GeForce NOW", "https://www.nvidia.com/en-us/geforce-now/", "https://logo.clearbit.com/nvidia.com")
+            apps += AppEntity(c, "JioGames", "https://play.jiogames.com/", "https://logo.clearbit.com/jiogames.com")
+            apps += AppEntity(c, "Google Translate", "https://translate.google.com/", null)
+            apps += AppEntity(c, "MyScript Calculator", "https://www.myscript.com/calculator/", "https://logo.clearbit.com/myscript.com")
+        }
+
+        // --- Shopping ---
+        run {
+            val c = idOf("Shopping")
+            apps += AppEntity(c, "Amazon", "https://www.amazon.in/", "https://upload.wikimedia.org/wikipedia/commons/a/a9/Amazon_logo.svg")
+            apps += AppEntity(c, "Flipkart", "https://www.flipkart.com/", "https://logo.clearbit.com/flipkart.com")
+            apps += AppEntity(c, "Meesho", "https://www.meesho.com/", "https://logo.clearbit.com/meesho.com")
+            apps += AppEntity(c, "Deal Genius", "https://www.dealgenius.com/", "https://logo.clearbit.com/dealgenius.com")
+        }
+
+        // --- Books & Comics ---
+        run {
+            val c = idOf("Books & Comics")
+            apps += AppEntity(c, "MangaSee", "https://mangasee123.com/", null)
+            apps += AppEntity(c, "Comic Book Plus", "https://comicbookplus.com/", "https://logo.clearbit.com/comicbookplus.com")
+            apps += AppEntity(c, "PDF Drive", "https://www.pdfdrive.com/", "https://logo.clearbit.com/pdfdrive.com")
+        }
+
+        // --- Payment ---
+        run {
+            val c = idOf("Payment")
+            apps += AppEntity(c, "Paytm", "https://paytm.com/", "https://logo.clearbit.com/paytm.com")
+            apps += AppEntity(c, "Google Pay", "https://pay.google.com/", "https://logo.clearbit.com/google.com")
+            apps += AppEntity(c, "PhonePe", "https://www.phonepe.com/", "https://logo.clearbit.com/phonepe.com")
+            apps += AppEntity(c, "CRED", "https://cred.club/", "https://logo.clearbit.com/cred.club")
+            apps += AppEntity(c, "Amazon Pay", "https://www.amazon.in/amazonpay/home", "https://logo.clearbit.com/amazon.in")
+        }
+
+        // --- Courses ---
+        run {
+            val c = idOf("Courses")
+            apps += AppEntity(c, "MIT OpenCourseWare", "https://ocw.mit.edu/", "https://logo.clearbit.com/mit.edu")
+            apps += AppEntity(c, "Khan Academy", "https://www.khanacademy.org/", "https://logo.clearbit.com/khanacademy.org")
+            apps += AppEntity(c, "freeCodeCamp", "https://www.freecodecamp.org/", "https://logo.clearbit.com/freecodecamp.org")
+            apps += AppEntity(c, "CourseX", "https://coursex.club/", null)
+        }
+
+        // --- Google & Others ---
+        run {
+            val c = idOf("Google & Others")
+            apps += AppEntity(c, "Google Maps", "https://maps.google.com/", null)
+            apps += AppEntity(c, "Gmail", "https://mail.google.com/", null)
+            apps += AppEntity(c, "Hack The Menu", "https://hackthemenu.com/", "https://logo.clearbit.com/hackthemenu.com")
+            apps += AppEntity(c, "SuperCook", "https://www.supercook.com/", "https://logo.clearbit.com/supercook.com")
+        }
+
+        // --- Business ---
+        run {
+            val c = idOf("Business")
+            apps += AppEntity(c, "ERPNext", "https://erpnext.com/", "https://logo.clearbit.com/erpnext.com")
+            apps += AppEntity(c, "WhatsApp Business", "https://www.whatsapp.com/business/", "https://logo.clearbit.com/whatsapp.com")
+        }
+
+        // --- Links/APKs ---
+        run {
+            val c = idOf("Links/APKs")
+            apps += AppEntity(c, "Uptodown", "https://en.uptodown.com/android", "https://logo.clearbit.com/uptodown.com")
+            apps += AppEntity(c, "GitHub", "https://github.com/", "https://logo.clearbit.com/github.com")
+            apps += AppEntity(c, "Softonic", "https://en.softonic.com/android", "https://logo.clearbit.com/softonic.com")
+        }
+
+        db.appDao().insertAll(apps)
+    }
+}
+
+// ---------------- VIEWMODEL ----------------
+class UniversalViewModel(app: Application) : AndroidViewModel(app) {
+    private val repo = UniversalRepository(UniversalDb.get(app))
+
+    val uiState: StateFlow<StateFlowUi> = repo.observe()
+        .map { cats ->
+            StateFlowUi(
+                categories = cats.map { c ->
+                    UiCategory(
+                        id = c.category.id,
+                        title = c.category.title,
+                        apps = c.apps.sortedBy { it.name }.map { a ->
+                            UiApp(a.id, a.name, a.website, a.logoUrl)
+                        }
+                    )
+                }
+            )
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), StateFlowUi(emptyList()))
+
+    init {
+        viewModelScope.launch { repo.ensureSeeded() }
+    }
+}
+
+// UI-layer models
+data class UiApp(val id: Long, val name: String, val website: String, val logoUrl: String?)
+data class UiCategory(val id: Long, val title: String, val apps: List<UiApp>)
+data class StateFlowUi(val categories: List<UiCategory>)
+
+// Factory (no Hilt to keep single file)
+class VmFactory(private val app: Application) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(UniversalViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return UniversalViewModel(app) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel")
+    }
+}
+
+// ---------------- NAVIGATION ----------------
+sealed class AppNav {
+    object Home : AppNav()
+    data class Web(val url: String) : AppNav()
+    data class ShowAd(val url: String) : AppNav()
+}
+data class AdState(val isVisible: Boolean, val url: String)
+
+// ---------------- MAIN ACTIVITY ----------------
+class MainActivity : ComponentActivity() {
+    @OptIn(ExperimentalAnimationApi::class)
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val vm = ViewModelProvider(this, VmFactory(application))[UniversalViewModel::class.java]
+        setContent { UniversalAppShell(vm) }
+    }
+}
+
+// ---------------- APP SHELL ----------------
+@OptIn(ExperimentalAnimationApi::class)
+@Composable
+fun UniversalAppShell(vm: UniversalViewModel) {
+    val navState = remember { mutableStateOf<AppNav>(AppNav.Home) }
+    val ui by vm.uiState.collectAsState()
+
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            primary = Color(0xFF7C4DFF),
+            secondary = Color(0xFF00E5FF),
+            background = Color.Transparent,
+            onPrimary = Color.White,
+            onBackground = Color.White
+        )
+    ) {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(AppGradient)
+                    .padding(12.dp)
+            ) {
+                when (val state = navState.value) {
+                    is AppNav.Home -> HomeScreen(
+                        categories = ui.categories,
+                        onOpen = { navState.value = AppNav.ShowAd(it) }
+                    )
+                    is AppNav.Web -> InAppWebView(state.url) { navState.value = AppNav.Home }
+                    is AppNav.ShowAd -> {}
+                }
+                AdOverlayManager(navState) { url -> navState.value = AppNav.Web(url) }
+            }
+        }
+    }
+}
+
+// ---------------- HOME SCREEN ----------------
+@Composable
+fun HomeScreen(categories: List<UiCategory>, onOpen: (String) -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Text(
+            "Universal App",
+            fontSize = 22.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = Color(0xFF111111),
+            modifier = Modifier.padding(start = 6.dp, top = 2.dp, bottom = 2.dp)
+        )
+        categories.forEach { cat ->
+            CategorySection(cat, onOpen)
+        }
+    }
+}
+
+@Composable
+fun CategorySection(category: UiCategory, onOpen: (String) -> Unit) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            category.title,
+            fontWeight = FontWeight.Black,
+            fontSize = 18.sp,
+            color = Color(0xFF1A1A1A),
+            modifier = Modifier.padding(start = 8.dp, bottom = 8.dp)
+        )
+        Card(
+            shape = SectionShape,
+            colors = CardDefaults.cardColors(containerColor = SectionContainer),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            // Adaptive grid with constant tile/icon size
+            AppGrid(
+                apps = category.apps,
+                onAppClick = onOpen
+            )
+        }
+    }
+}
+
+// ---------------- APP GRID ----------------
+@Composable
+fun AppGrid(apps: List<UiApp>, onAppClick: (String) -> Unit) {
+    // Tile target size ~110dp so icons look identical across devices
+    val minTile = 110.dp
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(minSize = minTile),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        userScrollEnabled = false // each section grows to fit; outer column scrolls
+    ) {
+        items(apps) { app ->
+            AppTile(app = app, onClick = { onAppClick(app.website) })
+        }
+    }
+}
+
+@Composable
+fun AppTile(app: UiApp, onClick: () -> Unit) {
+    var pressed by remember { mutableStateOf(false) }
+    val scale by animateFloatAsState(if (pressed) 0.96f else 1f, label = "tileScale")
+    Card(
+        shape = TileShape,
+        colors = CardDefaults.cardColors(containerColor = TileContainer),
+        modifier = Modifier
+            .aspectRatio(1f)
+            .scale(scale)
+            .clickable {
+                pressed = true
+                // small micro-interaction delay
+                LaunchedEffect(Unit) {
+                    delay(80)
+                    pressed = false
+                    onClick()
+                }
+            }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(10.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            LogoImage(app, sizeDp = 56.dp) // constant icon size
+            Spacer(Modifier.height(8.dp))
+            Text(
+                app.name,
+                fontSize = 12.sp,
+                color = Color(0xFF202020),
+                maxLines = 2
+            )
+        }
+    }
+}
+
+@Composable
+fun LogoImage(app: UiApp, sizeDp: Dp) {
+    val context = LocalContext.current
+    val resolvedLogo = app.logoUrl ?: run {
+        try {
+            val host = Uri.parse(app.website).host?.removePrefix("www.") ?: ""
+            if (host.isNotBlank()) "https://logo.clearbit.com/$host" else null
+        } catch (_: Exception) { null }
+    }
+    if (resolvedLogo != null) {
+        AsyncImage(
+            model = ImageRequest.Builder(context).data(resolvedLogo).crossfade(true).build(),
+            contentDescription = "${app.name} logo",
+            modifier = Modifier.size(sizeDp).clip(RoundedCornerShape(12.dp))
+        )
+    } else {
+        Box(
+            modifier = Modifier
+                .size(sizeDp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color(0xFFE9E9E9)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(app.name.firstOrNull()?.toString() ?: "?", fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+// ---------------- AD OVERLAY ----------------
+@Composable
+fun AdOverlayManager(navState: MutableState<AppNav>, afterAd: (String) -> Unit) {
+    var adState by remember { mutableStateOf<AdState?>(null) }
+
+    LaunchedEffect(navState.value) {
+        when (val state = navState.value) {
+            is AppNav.ShowAd -> {
+                adState = AdState(true, state.url)
+                delay(AD_DURATION_MS)
+                adState = adState?.copy(isVisible = false)
+                delay(220)
+                adState = null
+                afterAd(state.url)
+            }
+            else -> {}
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        adState?.let { st ->
+            AnimatedVisibility(
+                visible = st.isVisible,
+                enter = fadeIn(tween(220)) + slideInVertically(tween(300), initialOffsetY = { it / 4 }),
+                exit = fadeOut(tween(200))
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(18.dp),
+                    contentAlignment = Alignment.BottomCenter
+                ) {
+                    NativeAdCard()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun NativeAdCard() {
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .padding(14.dp)
+                .heightIn(min = 84.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(72.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color(0xFFEAEAEA)),
+                contentAlignment = Alignment.Center
+            ) { Text("Ad", fontWeight = FontWeight.ExtraBold) }
+
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Sponsored", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Native ad placeholder. Replace with your real ad view.",
+                    maxLines = 2,
+                    fontSize = 13.sp,
+                    color = Color.Gray
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            CircularProgressIndicator(modifier = Modifier.size(26.dp), strokeWidth = 3.dp)
+        }
+    }
+}
+
+// ---------------- WEBVIEW ----------------
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun InAppWebView(url: String, onClose: () -> Unit) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        SmallTopBar(url, onClose)
+        var webView: WebView? = null
+        AndroidView(
+            factory = { ctx ->
+                WebView(ctx).apply {
+                    webViewClient = WebViewClient()
+                    settings.javaScriptEnabled = true
+                    loadUrl(url)
+                    webView = this
+                }
+            },
+            modifier = Modifier.fillMaxSize(),
+            update = { it.loadUrl(url) }
+        )
+        DisposableEffect(Unit) { onDispose { webView?.destroy() } }
+    }
+}
+
+@Composable
+fun SmallTopBar(title: String, onBack: () -> Unit) {
+    TopAppBar(
+        title = { Text(title, maxLines = 1) },
+        navigationIcon = {
+            IconButton(onClick = onBack) { Text("<", color = Color.White) }
+        },
+        colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF232833))
+    )
+}
+```
+
+#### UniversalApp/build.gradle
+```gradle
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.2.0'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
+```
+
+#### UniversalApp/app/build.gradle
+```gradle
+apply plugin: 'com.android.application'
+apply plugin: 'kotlin-android'
+apply plugin: 'kotlin-kapt'
+
+android {
+    compileSdk 34
+    namespace 'com.example.universalapp'
+
+    defaultConfig {
+        applicationId "com.example.universalapp"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+    buildFeatures {
+        compose true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.5.10'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.activity:activity-compose:1.8.2'
+    implementation 'androidx.compose.material3:material3:1.2.1'
+    implementation 'androidx.compose.ui:ui:1.6.0'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0'
+    implementation 'androidx.room:room-runtime:2.6.1'
+    implementation 'androidx.room:room-ktx:2.6.1'
+    kapt 'androidx.room:room-compiler:2.6.1'
+    implementation 'io.coil-kt:coil-compose:2.4.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+}
+```
+
+#### UniversalApp/app/src/main/AndroidManifest.xml
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.universalapp">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.UniversalApp">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
+```
+
+#### UniversalApp/app/src/main/res/values/strings.xml
+```xml
+<resources>
+    <string name="app_name">Universal App</string>
+</resources>
+```
+
+#### UniversalApp/app/src/main/res/values/themes.xml
+```xml
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.UniversalApp" parent="Theme.Material3.Dark.NoActionBar">
+        <!-- Primary brand color. -->
+        <item name="colorPrimary">@color/purple_500</item>
+        <item name="colorPrimaryVariant">@color/purple_700</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <!-- Secondary brand color. -->
+        <item name="colorSecondary">@color/teal_200</item>
+        <item name="colorSecondaryVariant">@color/teal_700</item>
+        <item name="colorOnSecondary">@color/black</item>
+        <!-- Status bar color. -->
+        <item name="android:statusBarColor" tools:targetApi="l">?attr/colorPrimaryVariant</item>
+    </style>
+
+    <style name="Theme.UniversalApp.NoActionBar">
+        <item name="windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+    </style>
+</resources>
+```
+
+#### UniversalApp/app/src/main/res/values/colors.xml
+```xml
+<resources>
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>
+```
+
+#### UniversalApp/app/src/main/res/drawable/ic_launcher_foreground.xml
+```xml
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,20 a34,34 0 1,0 0,68 a34,34 0 1,0 0,-68 z"/>
+    <path
+        android:fillColor="#000000"
+        android:pathData="M54,30 a24,24 0 1,0 0,48 a24,24 0 1,0 0,-48 z"/>
+</vector>
+```
+
+#### UniversalApp/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+```xml
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/purple_500"/>
+    <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+</adaptive-icon>
+```
+
+#### UniversalApp/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+```xml
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/purple_500"/>
+    <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+</adaptive-icon>
+```
+
+#### UniversalApp/app/proguard-rules.pro
+```proguard
+# Add project specific ProGuard rules here.
+-keep class androidx.compose.** { *; }
+-keep class androidx.room.** { *; }
+-keep class coil.** { *; }
+```
+
+#### UniversalApp/settings.gradle
+```gradle
+rootProject.name = "UniversalApp"
+include ':app'
+```
+
+#### UniversalApp/codemagic.yaml
+```yaml
+workflows:
+  android-workflow:
+    name: Android Build
+    environment:
+      groups:
+        - android
+      android_signing:
+        - release_keystore
+    scripts:
+      - name: Build Android APK
+        script: |
+          ./gradlew assembleRelease
+    artifacts:
+      - app/build/outputs/apk/**/*.apk
+    publishing:
+      email:
+        recipients:
+          - your-email@example.com
+```
